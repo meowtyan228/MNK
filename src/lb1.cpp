@@ -6,6 +6,7 @@
 #include <chrono>
 #include <iomanip>
 #include <cstdlib>
+#include <limits>
 #include <Eigen/Dense>
 
 using namespace std;
@@ -32,6 +33,20 @@ vector<Point2D> GenPointsPoly(int n, double c0, double c1, double c2) {
     return pts;
 }
 
+MatrixXd makeMatrix200x200(int N, double cond = 100.0) {
+    MatrixXd U = MatrixXd::Random(N, N);
+    MatrixXd V = MatrixXd::Random(N, N);
+    
+    HouseholderQR<MatrixXd> qrU(U), qrV(V);
+    U = qrU.householderQ() * MatrixXd::Identity(N, N);
+    V = qrV.householderQ() * MatrixXd::Identity(N, N);
+
+    VectorXd s(N);
+    for (int i = 0; i < N; i++)
+        s(i) = pow(cond, -double(i) / (N - 1));
+
+    return U * s.asDiagonal() * V.transpose();
+}
 
 void delete_matrix(double** mat, int rows) {
     if (!mat) return;
@@ -47,6 +62,14 @@ VectorXd simple(const MatrixXd& A, const VectorXd& b) {
     return x;
 }
 
+VectorXd simple_tikhonov(const MatrixXd& A, const VectorXd& b, double alpha) {
+    MatrixXd AT = A.transpose();
+    MatrixXd ATA = AT * A;
+    MatrixXd reg = alpha * MatrixXd::Identity(A.cols(), A.cols());
+    MatrixXd ATA_inv = (ATA + reg).inverse();
+    return ATA_inv * AT * b;
+}
+
 void qr(double** A, int N, int m,
         double** Q1, double** R1) {
     double** R = new double*[N];
@@ -57,7 +80,7 @@ void qr(double** A, int N, int m,
 
     vector<vector<double>> us;
 
-    for (int k = 0; k < m && k < N - 1; k++) {
+    for (int k = 0; k < min(N, m); k++) {
         double norm = 0.0;
         for (int i = k; i < N; i++) norm += R[i][k] * R[i][k];
         norm = sqrt(norm);
@@ -152,7 +175,6 @@ VectorXd Qr(const MatrixXd& A, const VectorXd& b) {
     return x;
 }
 
-
 VectorXd svd(const MatrixXd& A, const VectorXd& b) {
     JacobiSVD<MatrixXd> svd(A, ComputeThinU | ComputeThinV);
     VectorXd x = svd.solve(b);
@@ -160,211 +182,195 @@ VectorXd svd(const MatrixXd& A, const VectorXd& b) {
 }
 
 void test(const string& name,
-               const MatrixXd& A,
-               const VectorXd& b,
-               const VectorXd& x)
+          const MatrixXd& A,
+          const VectorXd& b,
+          const VectorXd& x_true = VectorXd(), bool use_tikh = false)
 {
-    cout << "\n";
-    cout << "" << name << "\n";
+    cout << "\n" << name << "\n";
 
-    cout << "A (" << A.rows() << " x " << A.cols() << "):\n" << A << "\n\n";
-    cout << "b (" << b.rows() << "):\n" << b.transpose() << "\n\n";
-
-    if (x.size() > 0)
-        cout << "x: " << x.transpose() << "\n\n";
+    auto svA = JacobiSVD<MatrixXd>(A).singularValues();
+    cout << "cond(A)=" << svA(0) / svA(svA.size()-1);
 
     MatrixXd ATA = A.transpose() * A;
-    JacobiSVD<MatrixXd> svd_cond(ATA);
-    auto sv = svd_cond.singularValues();
-    double cond = sv(0) / sv(sv.size() - 1);
-    cout << "cond(A^T A) = " << cond << "\n\n";
+    auto svATA = JacobiSVD<MatrixXd>(ATA).singularValues();
+    cout << "  cond(A^T A)=";
+    if (svATA(svATA.size()-1) > 1e-300)
+        cout << svATA(0) / svATA(svATA.size()-1);
+    else
+        cout << "inf";
+    cout << "\n";
 
-    auto t1 = chrono::high_resolution_clock::now();
-    VectorXd x1;
-    bool ok1 = true;
-    try {
-        x1 = simple(A, b);
-        if (!x1.allFinite()) ok1 = false;
-    } catch (...) { ok1 = false; }
-    auto t2 = chrono::high_resolution_clock::now();
-    double ts1 = chrono::duration<double, milli>(t2 - t1).count();
+    bool has_true = (x_true.size() > 0);
 
-    t1 = chrono::high_resolution_clock::now();
-    VectorXd x2;
-    bool ok2 = true;
-    try {
-        x2 = Qr(A, b);
-        if (!x2.allFinite()) ok2 = false;
-    } catch (...) { ok2 = false; }
-    t2 = chrono::high_resolution_clock::now();
-    double ts2 = chrono::duration<double, milli>(t2 - t1).count();
+    auto run = [&](auto fn, const char* label) {
+        VectorXd x;
+        bool ok = true;
+        auto t1 = chrono::high_resolution_clock::now();
+        try { x = fn(A, b); if (!x.allFinite()) ok = false; }
+        catch (...) { ok = false; }
+        auto t2 = chrono::high_resolution_clock::now();
+        double ts = chrono::duration<double, milli>(t2 - t1).count();
 
-    t1 = chrono::high_resolution_clock::now();
-    VectorXd x3;
-    bool ok3 = true;
-    try {
-        x3 = svd(A, b);
-        if (!x3.allFinite()) ok3 = false;
-    } catch (...) { ok3 = false; }
-    t2 = chrono::high_resolution_clock::now();
-    double ts3 = chrono::duration<double, milli>(t2 - t1).count();
+        cout << label << ": ";
+        if (!ok) { cout << "FAIL\n"; return make_pair(VectorXd(), -1.0); }
 
-    cout << "Simple: ";
-    {
-        cout << "x = " << x1.transpose();
-        if (x.size() > 0) cout << "   err = " << (x1 - x).norm();
-        cout << "   time = " << ts1 << " ms\n";
-    }
-    cout << "QR:     ";
-    {
-        cout << "x = " << x2.transpose();
-        if (x.size() > 0) cout << "   err = " << (x2 - x).norm();
-        cout << "   time = " << ts2 << " ms\n";
-    }
-    cout << "SVD:    ";
-    {
-        cout << "x = " << x3.transpose();
-        if (x.size() > 0) cout << "   err = " << (x3 - x).norm();
-        cout << "   time = " << ts3 << " ms\n";
+        double grad_norm = (A.transpose() * (A * x - b)).norm();
+
+        cout << "res=" << (A*x - b).norm()
+             << " |grad|=" << scientific << grad_norm << fixed
+             << " |x|=" << x.norm()
+             << " t=" << ts << "ms";
+        
+        if (has_true) {
+            cout << " err=" << (x - x_true).norm();
+        }
+        cout << "\n";
+        return make_pair(x, ts);
+    };
+
+    auto r1 = run(simple, "simple");
+    auto r2 = run(Qr,     "qr    ");
+    auto r3 = run(svd,    "svd   ");
+    if (use_tikh) {
+        auto r4 = run([&](const MatrixXd& A, const VectorXd& b){ 
+            return simple_tikhonov(A, b, 1e-8); 
+        }, "tikh  ");
     }
 
-    if (ok1 && ok2 && ok3) {
-        cout << "\nРасстояния между решениями:\n";
-        cout << "  ||x_simple - x_qr||  = " << (x1 - x2).norm() << "\n";
-        cout << "  ||x_simple - x_svd|| = " << (x1 - x3).norm() << "\n";
-        cout << "  ||x_qr - x_svd||     = " << (x2 - x3).norm() << "\n";
+    if (r1.second >= 0 && r2.second >= 0 && r3.second >= 0) {
+        cout << "dist: s-qr=" << (r1.first - r2.first).norm()
+             << " s-svd="  << (r1.first - r3.first).norm()
+             << " qr-svd=" << (r2.first - r3.first).norm() << "\n";
     }
 }
 
-
 int main() {
-    cout << fixed << setprecision(8);
-    // Хорошая A
-    {
-        MatrixXd A(5, 3);
-        A << 1, 1, 1, 1, 2, 4, 1, 3, 9, 1, 4, 16, 1, 5, 25;
-        VectorXd b(5); b << 3, 7, 13, 21, 31;
-        VectorXd x(3); x << 1, 1, 1;
-        test("1. Хорошая A (Вандермонд)", A, b, x);
-    }
+    cout << fixed << setprecision(6);
 
-    // Почти линейно зависимые столбцы
+    // 1
     {
-        MatrixXd A(5, 2);
-        A << 1, 1,
-             1, 1 + 1e-8,
-             1, 1 + 2e-8,
-             1, 1 + 3e-8,
+        MatrixXd A(5,3);
+        A << 1,1,1, 1,2,4, 1,3,9, 1,4,16, 1,5,25;
+        VectorXd b(5); b << 3,7,13,21,31;
+        VectorXd x(3); x << 1,1,1;
+        test("1 vandermond", A, b, x);
+    }
+    // 2
+    {
+        MatrixXd A(5,2);
+        A << 1, 1, 
+             1, 1 + 1e-8, 
+             1, 1 + 2e-8, 
+             1, 1 + 3e-8, 
              1, 1 + 4e-8;
-        VectorXd b(5);
-        b << 2.0, 2.00000002, 2.00000004, 2.00000006, 2.00000008;
-        VectorXd x(2); x << 1, 1;
-        test("2. Почти линейно зависимые столбцы", A, b, x);
+             
+        VectorXd b(5); b << 2.0, 2.0 + 2e-8, 2.0 + 4e-8, 2.0 + 6e-8, 2.0 + 8e-8;
+        
+        VectorXd x(2); x << 0, 2;
+        test("2 near lin dep", A, b, x, true);
     }
-
-    // Вырожденная A
+    // 3
     {
-        MatrixXd A(4, 2);
-        A << 1, 2, 2, 4, 3, 6, 4, 8;
-        VectorXd b(4); b << 3, 6, 9, 12;
-        VectorXd x(2); x << 1, 1;
-        test("3. Вырожденная A (ранг 1)", A, b, x);
+        MatrixXd A(4,2);
+        A << 1,2, 2,4, 3,6, 4,8;
+        VectorXd b(4); b << 3,6,9,12;
+        test("3 singular rank1", A, b, VectorXd(), true);
     }
-
-    // Большой разброс значений
+    // 4
     {
-        MatrixXd A(4, 3);
-        A << 1e8, 0, 0,
-             0, 1, 0,
-             0, 0, 1e-8,
+        MatrixXd A(4,3);
+        A << 1e7, 0, 0, 
+             0, 1, 0, 
+             0, 0, 1e-7, 
              1, 1, 1;
-        VectorXd b(4); b << 1e8, 1, 1e-8, 3;
-        VectorXd x(3); x << 1, 1, 1;
-        test("4. Большой разброс значений", A, b, x);
+        VectorXd b(4); b << 1e5, 1, 1e-7, 2.01;
+        VectorXd x(3); x << 0.01, 1, 1;
+        test("4 big spread", A, b, x);
     }
-
-    // Почти вырожденная A
+    // 5
     {
-        MatrixXd A(4, 2);
-        A << 1, 1,
-             1, 1 + 1e-12,
-             1, 1 + 2e-12,
-             1, 1 + 3e-12;
-        VectorXd b(4);
-        b << 2.0, 2.0 + 1e-12, 2.0 + 2e-12, 2.0 + 3e-12;
-        VectorXd x(2); x << 1, 1;
-        test("5. Почти вырожденная A", A, b, x);
+        MatrixXd A(4,2);
+        A << 1,1, 1,1+1e-12, 1,1+2e-12, 1,1+3e-12;
+        VectorXd b(4); b << 2,2+1e-12,2+2e-12,2+3e-12;
+        VectorXd x(2); x << 1,1;
+        test("5 near singular", A, b, x, true);
     }
-
-    // Разреженная A
+    // 6
     {
-        MatrixXd A(4, 4);
-        A << 1, 0, 0, 1e-6,
-             0, 1, 0, 1e-6,
-             0, 0, 1, 1e-6,
-             0, 0, 0, 1e-6;
-        VectorXd b(4); b << 1, 1, 1, 1e-6;
-        VectorXd x(4); x << 1, 1, 1, 1;
-        test("6. Разреженная A", A, b, x);
+        MatrixXd A(4,4);
+        A << 1,0,0,1e-6, 0,1,0,1e-6, 0,0,1,1e-6, 0,0,0,1e-6;
+        VectorXd b(4); b << 1,1,1,1e-6;
+        VectorXd x(4); x << 1-1e-6,1-1e-6,1-1e-6,1;
+        test("6 sparse", A, b, x);
+    }
+    // 7
+    {
+        int N = 200;
+        MatrixXd A = makeMatrix200x200(N, 100.0); 
+        VectorXd x_true = VectorXd::Random(N); 
+        VectorXd b = A * x_true; 
+        test("7 matrix 200x200", A, b, x_true);
     }
 
+    // poly
     int n = 100;
-    double c0_true = 1.0, c1_true = 2.0, c2_true = 0.5;
-    normal_distribution<double> noise_pts(0.0, 2.0);
+    double c0 = 1.0, c1 = 2.0, c2 = 0.5;
+    auto pts = GenPointsPoly(n, c0, c1, c2);
 
-    vector<Point2D> pts(n);
-    for (int i = 0; i < n; i++) {
-        double x = dist_u(gen);
-        double y = c0_true + c1_true * x + c2_true * x * x + noise_pts(gen);
-        pts[i] = { x, y };
-    }
-
-    MatrixXd A(n, 3);
+    MatrixXd A(n,3);
     VectorXd b(n);
     for (int i = 0; i < n; i++) {
         double x = pts[i].x;
-        A(i, 0) = 1.0;
-        A(i, 1) = x;
-        A(i, 2) = x * x;
-        b(i) = pts[i].y;
+        A(i,0)=1; A(i,1)=x; A(i,2)=x*x;
+        b(i)=pts[i].y;
     }
 
-    MatrixXd ATA = A.transpose() * A;
-    JacobiSVD<MatrixXd> svd_cond(ATA);
-    auto sv = svd_cond.singularValues();
-    cout << "cond(A^T A) = " << sv(0) / sv(2) << "\n\n";
+    auto sv = JacobiSVD<MatrixXd>(A).singularValues();
+    cout << "\npoly n=" << n << "\n";
+    cout << "cond(A)=" << sv(0)/sv(2) << "\n";
 
-    VectorXd x1 = simple(A, b);
-    VectorXd x2 = Qr(A, b);
-    VectorXd x3 = svd(A, b);
+    VectorXd x1 = simple(A,b), x2 = Qr(A,b), x3 = svd(A,b);
+    VectorXd xt(3); xt << c0,c1,c2;
 
-    cout << "Simple: c0=" << x1(0) << "  c1=" << x1(1) << "  c2=" << x1(2) << "\n";
-    cout << "QR:     c0=" << x2(0) << "  c1=" << x2(1) << "  c2=" << x2(2) << "\n";
-    cout << "SVD:    c0=" << x3(0) << "  c1=" << x3(1) << "  c2=" << x3(2) << "\n";
-    cout << "True:   c0=" << c0_true << "  c1=" << c1_true << "  c2=" << c2_true << "\n";
+    auto print_poly = [&](const VectorXd& x, const string& name) {
+        auto t1 = chrono::high_resolution_clock::now();
+        VectorXd x_res = x;
+        double res = (A * x - b).norm();
+        double grad = (A.transpose() * (A * x - b)).norm();
+        double err = (x - xt).norm();
+        double norm_x = x.norm();
+        auto t2 = chrono::high_resolution_clock::now();
+        double ts = chrono::duration<double, milli>(t2 - t1).count();
 
-    VectorXd xt(3); xt << c0_true, c1_true, c2_true;
-    cout << "||x_simple - x|| = " << (x1 - xt).norm() << "\n";
-    cout << "||x_qr     - x|| = " << (x2 - xt).norm() << "\n";
-    cout << "||x_svd    - x|| = " << (x3 - xt).norm() << "\n";
+        cout << name << ": " 
+             << x.transpose() 
+             << " | res=" << res 
+             << " | |grad|=" << scientific << grad << fixed 
+             << " | |x|=" << norm_x
+             << " | t=" << ts << "ms"
+             << " | err=" << err << "\n";
+    };
+
+    print_poly(x1, "simple");
+    print_poly(x2, "qr    ");
+    print_poly(x3, "svd   ");
+    cout << "true  : " << xt.transpose() << "\n";
 
     ofstream fpts("points.txt");
     for (auto& p : pts) fpts << p.x << " " << p.y << "\n";
     fpts.close();
 
     ofstream fp("poly.txt");
-    double x_min = -5.0, x_max = 5.0;
-    int M = 200;
-    for (int i = 0; i < M; i++) {
-        double x = x_min + (x_max - x_min) * i / (M - 1);
-        double y_true   = c0_true + c1_true * x + c2_true * x * x;
-        double y_simple = x1(0) + x1(1) * x + x1(2) * x * x;
-        double y_qr     = x2(0) + x2(1) * x + x2(2) * x * x;
-        double y_svd    = x3(0) + x3(1) * x + x3(2) * x * x;
-        fp << x << " " << y_true << " " << y_simple << " " << y_qr << " " << y_svd << "\n";
+    for (int i = 0; i < 200; i++) {
+        double x = -5.0 + 10.0*i/199;
+        fp << x
+           << " " << c0+c1*x+c2*x*x
+           << " " << x1(0)+x1(1)*x+x1(2)*x*x
+           << " " << x2(0)+x2(1)*x+x2(2)*x*x
+           << " " << x3(0)+x3(1)*x+x3(2)*x*x
+           << "\n";
     }
     fp.close();
-    //system("gnuplot -persist -c plot.gp points.txt poly.txt");
 
     return 0;
 }
